@@ -1,0 +1,17 @@
+{
+  "name": "食光 - 家庭食材助手",
+  "short_name": "食光",
+  "description": "管理家庭食材、发现匹配菜谱、安排饮食计划并整理采购清单的本地优先厨房助手。",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f8faf7",
+  "theme_color": "#f8faf7",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

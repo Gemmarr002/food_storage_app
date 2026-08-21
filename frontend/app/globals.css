@@ -1,0 +1,55 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import 'shadcn/tailwind.css';
+
+@theme inline {
+  --font-sans: var(--font-noto-sans), sans-serif;
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * .65);
+  --radius-md: calc(var(--radius) * .8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.35);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.3);
+}
+
+:root {
+  color-scheme: light;
+  --background: oklch(.985 .008 140);
+  --foreground: oklch(.24 .025 145);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(.24 .025 145);
+  --primary: oklch(.51 .115 145);
+  --primary-foreground: oklch(.99 .005 145);
+  --secondary: oklch(.94 .018 142);
+  --secondary-foreground: oklch(.34 .055 145);
+  --muted: oklch(.94 .01 140);
+  --muted-foreground: oklch(.52 .025 145);
+  --destructive: oklch(.58 .22 27);
+  --border: oklch(.9 .015 140);
+  --input: oklch(.9 .015 140);
+  --ring: oklch(.56 .12 145);
+  --radius: .75rem;
+}
+
+@layer base {
+  * { @apply border-border outline-ring/50; }
+  body { @apply bg-background text-foreground; }
+  button, select { cursor: pointer; }
+}
+
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
