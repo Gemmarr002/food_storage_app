@@ -2,13 +2,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, Dispatch, ElementType, ReactNode, SetStateAction } from 'react'
 import { BookOpen, CalendarDays, Check, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, CircleUserRound, Download, Heart, Home, ImagePlus, MoreHorizontal, Pencil, Plus, Refrigerator, Search, ShoppingBag, ShoppingCart, Sparkles, Trash2, Upload, Wand2, X } from 'lucide-react'
-import type { Ingredient, Meal, MealPlan, Preferences, Recipe, ShoppingItem, Tab } from '@/lib/types'
+import type { ChatMessage, Conversation, Ingredient, Meal, MealPlan, Preferences, Recipe, ShoppingItem, Tab } from '@/lib/types'
 import { CATEGORIES, DIFFICULTIES, FLAVORS, PREF_TIME_OPTIONS, SYSTEM_RECIPES, TIME_OPTIONS, UNITS, computeFreshness, defaultPrefs, dictUnit, filterByDiet, getWeek, iconFor, matchPct, normalize, searchDict, seedIngredients, seedPlan, seedShopping, toDateKey } from '@/lib/data'
 import type { PlanContext, PlanFilters } from '@/lib/planner'
 import { collectMissing, generateDayPlan, generateWeekPlan } from '@/lib/planner'
-import { loadAll, saveAll } from '@/lib/db'
+import { clearAll, loadAll, loadChatMessages, loadConversations, loadLastActiveConversationId, saveAll, saveChatMessage, saveConversation, saveLastActiveConversationId } from '@/lib/db'
 import { buildAiContext } from '@/lib/aiContext'
-import { consumeCozeSse } from '@/lib/chatStream'
+import { consumeChatSse } from '@/lib/chatStream'
 
 const field = 'w-full rounded-xl border border-border bg-background px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-primary/20'
 const primary = 'rounded-xl bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground'
@@ -18,10 +18,21 @@ const dangerBtn = 'rounded-xl bg-destructive px-4 py-2.5 text-sm font-semibold t
 type ShopDraft = { name: string; normalizedName: string; quantity: number; unit: string; source: string }
 
 // crypto.randomUUID 仅在安全上下文（HTTPS / localhost）可用；手机经局域网 IP 走 HTTP 时不存在，需回退
-const uid = (): string =>
-  typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-    ? crypto.randomUUID()
-    : `u-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+const uid = (): string => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  const bytes = new Uint8Array(16)
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') crypto.getRandomValues(bytes)
+  else for (let i = 0; i < bytes.length; i += 1) bytes[i] = Math.floor(Math.random() * 256)
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+function createConversation(): Conversation {
+  const now = new Date().toISOString()
+  return { id: uid(), title: '新对话', cozeSessionId: uid(), createdAt: now, updatedAt: now }
+}
 
 function statusColor(status: string) {
   if (status === '新鲜') return 'bg-green-100 text-green-700'
@@ -93,7 +104,7 @@ function Empty({ icon, copy, action }: { icon: ReactNode; copy: string; action?:
 
 function Dropdown({ label, options, selected, multi, onChange, active }: { label: string; options: string[]; selected: string[]; multi: boolean; onChange: (next: string[]) => void; active: boolean }) {
   const [open, setOpen] = useState(false)
-  const [pos, setPos] = useState<{ top: number; left: number }>({ top: 0, left: 0 })
+  const [pos, setPos] = useState<{ top: number; left: number; width: number; maxHeight: number }>({ top: 0, left: 0, width: 192, maxHeight: 240 })
   const btnRef = useRef<HTMLButtonElement>(null)
   const toggle = (o: string) => {
     if (multi) onChange(selected.includes(o) ? selected.filter(x => x !== o) : [...selected, o])
@@ -101,13 +112,25 @@ function Dropdown({ label, options, selected, multi, onChange, active }: { label
   }
   const openDropdown = () => {
     // 用 fixed 定位弹出，避免被外层滚动容器 overflow 裁剪；下方空间不足时自动改为向上弹出
-    const r = btnRef.current?.getBoundingClientRect()
-    if (r) {
-      const cardH = 200
-      const below = window.innerHeight - r.bottom
+    const button = btnRef.current
+    const r = button?.getBoundingClientRect()
+    if (button && r) {
+      const shell = button.closest('[data-app-shell]')?.getBoundingClientRect()
+        ?? { left: 0, right: window.innerWidth, top: 0, bottom: window.innerHeight, width: window.innerWidth }
+      const margin = 8
+      const width = Math.min(192, shell.width - margin * 2)
+      const estimatedHeight = Math.min(240, 32 + Math.ceil(options.length / 3) * 34 + (multi && selected.length ? 30 : 0))
+      const below = shell.bottom - r.bottom - margin
+      const above = r.top - shell.top - margin
+      const placeBelow = below >= estimatedHeight || below >= above
+      const top = placeBelow
+        ? r.bottom + margin
+        : Math.max(shell.top + margin, r.top - estimatedHeight - margin)
       setPos({
-        top: below >= cardH ? r.bottom + 8 : Math.max(8, r.top - cardH - 8),
-        left: Math.max(8, Math.min(r.left, window.innerWidth - 200 - 8)),
+        top,
+        left: Math.max(shell.left + margin, Math.min(r.left, shell.right - width - margin)),
+        width,
+        maxHeight: Math.max(80, placeBelow ? shell.bottom - top - margin : r.top - top - margin),
       })
     }
     setOpen(v => !v)
@@ -119,7 +142,7 @@ function Dropdown({ label, options, selected, multi, onChange, active }: { label
       </button>
       {open && <>
         <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
-        <div className="fixed z-40 w-48 rounded-2xl border bg-background p-3 shadow-xl" style={{ top: pos.top, left: pos.left }}>
+        <div className="fixed z-40 overflow-y-auto rounded-2xl border bg-background p-3 shadow-xl" style={{ top: pos.top, left: pos.left, width: pos.width, maxHeight: pos.maxHeight }}>
           <div className="flex flex-wrap gap-2">
             {options.map(o => (
               <button key={o} onClick={() => toggle(o)} className={`rounded-full px-3 py-1.5 text-xs ${selected.includes(o) ? 'bg-primary text-primary-foreground' : 'bg-secondary'}`}>{o}</button>
@@ -144,7 +167,7 @@ function mergeGenerated(p: MealPlan, gen: MealPlan, meals: Meal[]): MealPlan {
   return next
 }
 
-export default function FoodApp() {
+export default function FoodApp({ initialChatOpen = false }: { initialChatOpen?: boolean }) {
   const [loaded, setLoaded] = useState(false)
   const [tab, setTab] = useState<Tab>('食材')
   const [ingredients, setIngredients] = useState<Ingredient[]>(seedIngredients)
@@ -160,11 +183,15 @@ export default function FoodApp() {
   const [weekOffset, setWeekOffset] = useState(0)
   const [confirmBox, setConfirmBox] = useState<null | { text: string; okText?: string; cancelText?: string; danger?: boolean; onOk: () => void }>(null)
   const [mergeDlg, setMergeDlg] = useState<null | { conflicts: { draft: ShopDraft; existing: ShoppingItem }[]; choices: boolean[] }>(null)
-  const [aiOpen, setAiOpen] = useState(false)
+  const [aiOpen, setAiOpen] = useState(initialChatOpen)
   const [aiLocal, setAiLocal] = useState(true)
-  const [chat, setChat] = useState<ChatMsg[]>([])
+  const [chat, setChat] = useState<ChatMessage[]>([])
+  const [conversations, setConversations] = useState<Conversation[]>([])
+  const [conversation, setConversation] = useState<Conversation | null>(null)
+  const [chatReady, setChatReady] = useState(false)
   const [aiBusy, setAiBusy] = useState(false)
-  const aiSessionRef = useRef<string>('')
+  const [online, setOnline] = useState(true)
+  const aiAbortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
     loadAll().then(data => {
@@ -181,15 +208,66 @@ export default function FoodApp() {
   }, [])
 
   useEffect(() => {
+    let active = true
+    Promise.all([loadConversations(), loadLastActiveConversationId()])
+      .then(async ([saved, lastActiveId]) => {
+        let current = saved.find(item => item.id === lastActiveId) ?? saved[0]
+        let next = saved
+        if (!current) {
+          current = createConversation()
+          next = [current]
+          await saveConversation(current)
+        }
+        await saveLastActiveConversationId(current.id)
+        const messages = await loadChatMessages(current.id)
+        if (!active) return
+        setConversations(next)
+        setConversation(current)
+        setChat(messages)
+        setChatReady(true)
+      })
+      .catch(() => {
+        if (active) {
+          const fallback = createConversation()
+          setToast('聊天记录读取失败，本地功能不受影响')
+          setConversations([fallback])
+          setConversation(fallback)
+          setChatReady(true)
+        }
+      })
+    return () => { active = false }
+  }, [])
+
+  useEffect(() => {
+    const update = () => setOnline(navigator.onLine)
+    update()
+    window.addEventListener('online', update)
+    window.addEventListener('offline', update)
+    return () => {
+      window.removeEventListener('online', update)
+      window.removeEventListener('offline', update)
+    }
+  }, [])
+
+  useEffect(() => {
     if (!loaded) return
     saveAll({ ingredients, myRecipes: recipes.filter(r => !r.isSystem), favorites, shopping, plan, preferences: prefs })
   }, [loaded, ingredients, recipes, favorites, shopping, plan, prefs])
 
-  // PWA Service Worker（仅生产环境注册，避免干扰开发热更新）
+  // 生产环境注册 PWA；开发环境主动移除同源旧 SW/缓存，避免手机加载旧壳后无法 hydration。
   useEffect(() => {
-    if (process.env.NODE_ENV === 'production' && 'serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/sw.js').catch(() => {})
+    if (!('serviceWorker' in navigator)) return
+    if (process.env.NODE_ENV === 'production') {
+      navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' })
+        .then(registration => registration.update())
+        .catch(() => {})
+      return
     }
+    navigator.serviceWorker.getRegistrations()
+      .then(registrations => Promise.all(registrations.map(registration => registration.unregister())))
+      .then(() => caches.keys())
+      .then(keys => Promise.all(keys.filter(key => key.startsWith('shiguang-')).map(key => caches.delete(key))))
+      .catch(() => {})
   }, [])
 
   const notify = (s: string) => { setToast(s); setTimeout(() => setToast(''), 1800) }
@@ -238,60 +316,122 @@ export default function FoodApp() {
     notify('采购清单已更新')
   }
 
-  // AI 助手：每轮注入最新本地事实，并流式消费 Coze Coding Agent SSE。
-  const sendChat = async (text: string) => {
-    const q = text.trim()
-    if (!q || q.length > 2_000 || aiBusy) return
-    if (!aiSessionRef.current) aiSessionRef.current = crypto.randomUUID()
-    const history: ChatMsg[] = [
-      ...chat,
-      { role: 'user', content: q },
-      { role: 'assistant', content: '', status: 'streaming', retryText: q },
-    ]
-    const assistantIndex = history.length - 1
-    setChat(history)
+  const runAssistant = async (q: string, current: Conversation, assistant: ChatMessage) => {
+    const controller = new AbortController()
+    aiAbortRef.current = controller
+    let reply = ''
+    const timeout = window.setTimeout(() => controller.abort('timeout'), 60_000)
     setAiBusy(true)
     try {
+      let currentContext = null
+      if (aiLocal) {
+        await saveAll({ ingredients, myRecipes: recipes.filter(recipe => !recipe.isSystem), favorites, shopping, plan, preferences: prefs })
+        const latest = await loadAll()
+        currentContext = buildAiContext(latest?.ingredients ?? ingredients, latest?.preferences ?? prefs)
+      }
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: q,
-          sessionId: aiSessionRef.current,
-          context: aiLocal ? buildAiContext(ingredients, prefs) : null,
+          sessionId: current.cozeSessionId,
+          context: currentContext,
         }),
+        signal: controller.signal,
       })
       if (!res.ok) {
         const data = await res.json().catch(() => null)
         throw new Error((data?.error as string) ?? 'AI 助手出错了，请稍后再试')
       }
-      let reply = ''
-      await consumeCozeSse(res, chunk => {
-        reply += chunk
-        setChat(current => current.map((item, index) =>
-          index === assistantIndex ? { ...item, content: reply, status: 'streaming' } : item,
-        ))
+      await consumeChatSse(res, event => {
+        if (event.type !== 'delta') return
+        reply += event.text
+        setChat(items => items.map(item => item.id === assistant.id ? { ...item, content: reply } : item))
       })
-      setChat(current => current.map((item, index) =>
-        index === assistantIndex ? { ...item, content: reply || '（无回复）', status: 'done' } : item,
-      ))
+      const completed: ChatMessage = { ...assistant, content: reply || '（无回复）', status: 'done' }
+      setChat(items => items.map(item => item.id === assistant.id ? completed : item))
+      await saveChatMessage(completed)
     } catch (error) {
-      const message = error instanceof Error ? error.message : '网络错误，请稍后再试'
-      setChat(current => current.map((item, index) =>
-        index === assistantIndex ? { ...item, content: `发送失败：${message}`, status: 'error' } : item,
-      ))
+      const reason = controller.signal.reason
+      const message = reason === 'timeout'
+        ? '等待超过 60 秒，请重试'
+        : reason === 'cancelled'
+          ? '已取消本次回答'
+          : error instanceof Error ? error.message : '网络错误，请稍后再试'
+      const failed: ChatMessage = { ...assistant, content: reply, status: 'error' }
+      setChat(items => items.map(item => item.id === assistant.id ? failed : item))
+      await saveChatMessage(failed).catch(() => {})
       notify(message)
     } finally {
+      window.clearTimeout(timeout)
+      if (aiAbortRef.current === controller) aiAbortRef.current = null
       setAiBusy(false)
     }
   }
 
-  const newAiConversation = () => {
+  // AI 助手：用户消息先落盘，每轮再读取当前 React/IndexedDB 对应的最新本地事实。
+  const sendChat = async (text: string) => {
+    const q = text.trim()
+    if (!q || q.length > 2_000 || aiBusy || !conversation || !chatReady) return
+    if (!online) return notify('当前离线，厨房助手暂不可用')
+    const now = new Date().toISOString()
+    const userMessage: ChatMessage = { id: uid(), conversationId: conversation.id, role: 'user', content: q, status: 'done', createdAt: now }
+    const assistant: ChatMessage = { id: uid(), conversationId: conversation.id, role: 'assistant', content: '', status: 'streaming', createdAt: new Date(Date.now() + 1).toISOString() }
+    const updated = { ...conversation, title: conversation.title === '新对话' ? q.slice(0, 20) : conversation.title, updatedAt: now }
+    setConversation(updated)
+    setConversations(items => [updated, ...items.filter(item => item.id !== updated.id)])
+    setChat(items => [...items, userMessage, assistant])
+    try {
+      await Promise.all([saveChatMessage(userMessage), saveConversation(updated), saveLastActiveConversationId(updated.id)])
+    } catch {
+      const failed = { ...assistant, status: 'error' as const }
+      setChat(items => items.map(item => item.id === assistant.id ? failed : item))
+      notify('消息无法保存，请检查浏览器存储权限')
+      return
+    }
+    await runAssistant(q, updated, assistant)
+  }
+
+  const retryChat = async (assistantId: string) => {
+    if (aiBusy || !conversation || !online) return
+    const index = chat.findIndex(item => item.id === assistantId)
+    const question = [...chat.slice(0, index)].reverse().find(item => item.role === 'user')
+    const failed = chat[index]
+    if (!question || !failed) return
+    const retrying = { ...failed, content: '', status: 'streaming' as const }
+    setChat(items => items.map(item => item.id === assistantId ? retrying : item))
+    await runAssistant(question.content, conversation, retrying)
+  }
+
+  const newAiConversation = async () => {
     if (aiBusy) return
-    aiSessionRef.current = crypto.randomUUID()
+    const next = createConversation()
+    try {
+      await Promise.all([saveConversation(next), saveLastActiveConversationId(next.id)])
+    } catch {
+      return notify('新对话保存失败，请检查浏览器存储权限')
+    }
+    setConversation(next)
+    setConversations(items => [next, ...items])
     setChat([])
     notify('已新建对话')
   }
+
+  const switchAiConversation = async (id: string) => {
+    if (aiBusy || id === conversation?.id) return
+    const next = conversations.find(item => item.id === id)
+    if (!next) return
+    try {
+      const messages = await loadChatMessages(next.id)
+      await saveLastActiveConversationId(next.id)
+      setConversation(next)
+      setChat(messages)
+    } catch {
+      notify('聊天记录读取失败')
+    }
+  }
+
+  const cancelChat = () => aiAbortRef.current?.abort('cancelled')
 
   // 食材：加入采购清单（去重）
   const requestAddToShop = (ing: Ingredient) => { setTarget(ing.id); setSheet('addToShop') }
@@ -335,7 +475,27 @@ export default function FoodApp() {
     setConfirmBox({ text: '导入将覆盖当前所有数据，是否继续？', okText: '确认导入', onOk: () => doImport(file) })
   }
   const doClear = () => {
-    setConfirmBox({ text: '此操作将删除所有本地数据，包括食材、菜谱、计划、采购清单，且不可恢复。确定继续吗？', okText: '确定清空', danger: true, onOk: () => { setIngredients([]); setRecipes(SYSTEM_RECIPES); setFavorites([]); setShopping([]); setPlan({}); setPrefs(defaultPrefs); notify('已清空全部本地数据') } })
+    setConfirmBox({
+      text: '此操作将删除所有本地数据，包括食材、菜谱、计划、采购清单和聊天记录，且不可恢复。确定继续吗？',
+      okText: '确定清空',
+      danger: true,
+      onOk: async () => {
+        aiAbortRef.current?.abort('cancelled')
+        await clearAll()
+        const next = createConversation()
+        await Promise.all([saveConversation(next), saveLastActiveConversationId(next.id)])
+        setIngredients([])
+        setRecipes(SYSTEM_RECIPES)
+        setFavorites([])
+        setShopping([])
+        setPlan({})
+        setPrefs(defaultPrefs)
+        setConversation(next)
+        setConversations([next])
+        setChat([])
+        notify('已清空全部本地数据')
+      },
+    })
   }
 
   if (!loaded) {
@@ -344,7 +504,7 @@ export default function FoodApp() {
 
   return (
     <main className="flex min-h-screen items-center justify-center bg-muted sm:p-6">
-      <div className="relative flex h-dvh w-full max-w-[390px] flex-col overflow-hidden bg-background shadow-2xl sm:h-[844px] sm:rounded-[28px]">
+      <div data-app-shell className="relative flex h-dvh w-full max-w-[390px] flex-col overflow-hidden bg-background shadow-2xl sm:h-[844px] sm:rounded-[28px]">
         {toast && <div className="absolute left-1/2 top-7 z-[90] -translate-x-1/2 whitespace-nowrap rounded-full bg-foreground px-4 py-2 text-xs text-background">{toast}</div>}
         <div className="min-h-0 flex-1 overflow-y-auto pb-5 no-scrollbar">
           {tab === '食材' && <Ingredients items={ingredients} add={() => setSheet('addIngredient')} menu={id => { setTarget(id); setSheet('ingredientMenu') }} />}
@@ -376,13 +536,21 @@ export default function FoodApp() {
         {aiOpen && (
           <AiChat
             messages={chat}
+            conversations={conversations}
+            conversationId={conversation?.id ?? ''}
             busy={aiBusy}
+            ready={chatReady}
+            online={online}
             aiLocal={aiLocal}
             setAiLocal={setAiLocal}
             onSend={sendChat}
+            onRetry={retryChat}
+            onCancel={cancelChat}
             onNewConversation={newAiConversation}
+            onSwitchConversation={switchAiConversation}
             onOpenRecipe={id => { setAiOpen(false); setTarget(id); setSheet('recipe') }}
             recipes={recipes}
+            context={buildAiContext(ingredients, prefs)}
             close={() => setAiOpen(false)}
           />
         )}
@@ -1238,27 +1406,28 @@ function Preference({ title, values, selected, change }: { title: string; values
   )
 }
 
-type ChatMsg = {
-  role: 'user' | 'assistant'
-  content: string
-  status?: 'streaming' | 'done' | 'error'
-  retryText?: string
-}
-
 // 在 AI 回复里找出命中的本地菜谱（复用 normalize 匹配 title），供"查看菜谱"按钮使用
 function findMentionedRecipes(text: string, recipes: Recipe[]): Recipe[] {
   return recipes.filter(r => r.title && text.includes(r.title))
 }
 
-function AiChat({ messages, busy, aiLocal, setAiLocal, onSend, onNewConversation, onOpenRecipe, recipes, close }: {
-  messages: ChatMsg[]
+function AiChat({ messages, conversations, conversationId, busy, ready, online, aiLocal, setAiLocal, onSend, onRetry, onCancel, onNewConversation, onSwitchConversation, onOpenRecipe, recipes, context, close }: {
+  messages: ChatMessage[]
+  conversations: Conversation[]
+  conversationId: string
   busy: boolean
+  ready: boolean
+  online: boolean
   aiLocal: boolean
   setAiLocal: (x: boolean) => void
   onSend: (text: string) => void
+  onRetry: (assistantId: string) => void
+  onCancel: () => void
   onNewConversation: () => void
+  onSwitchConversation: (id: string) => void
   onOpenRecipe: (id: string) => void
   recipes: Recipe[]
+  context: ReturnType<typeof buildAiContext>
   close: () => void
 }) {
   const inputRef = useRef<HTMLInputElement>(null)
@@ -1270,7 +1439,7 @@ function AiChat({ messages, busy, aiLocal, setAiLocal, onSend, onNewConversation
 
   const submit = () => {
     const v = inputRef.current?.value ?? ''
-    if (!v.trim() || busy) return
+    if (!v.trim() || busy || !ready || !online) return
     onSend(v)
     if (inputRef.current) inputRef.current.value = ''
   }
@@ -1281,10 +1450,15 @@ function AiChat({ messages, busy, aiLocal, setAiLocal, onSend, onNewConversation
     <Sheet title="AI 助手" close={close}>
       <div className="flex h-[70vh] flex-col">
         {/* 本地数据开关 */}
-        <div className="flex items-center justify-between border-b px-5 py-3">
-          <div className="flex items-center gap-2">
-            <span className="text-sm">接入我的食材数据</span>
-            <button className="rounded-full border px-2.5 py-1 text-[11px]" onClick={onNewConversation} disabled={busy}>新对话</button>
+        <div className="flex items-center justify-between gap-3 border-b px-5 py-3">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span className="text-sm">接入我的食材数据</span>
+              <button className="rounded-full border px-2.5 py-1 text-[11px]" onClick={onNewConversation} disabled={busy}>新对话</button>
+            </div>
+            <select aria-label="切换历史对话" className="mt-2 w-full truncate rounded-lg border bg-background px-2 py-1 text-xs" value={conversationId} onChange={event => onSwitchConversation(event.target.value)} disabled={busy || !ready}>
+              {conversations.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}
+            </select>
           </div>
           <button
             aria-label="切换接入本地数据"
@@ -1294,7 +1468,20 @@ function AiChat({ messages, busy, aiLocal, setAiLocal, onSend, onNewConversation
             <span className={`absolute top-0.5 size-5 rounded-full bg-white transition-all ${aiLocal ? 'left-[22px]' : 'left-0.5'}`} />
           </button>
         </div>
-        <div className="px-5 pt-1 text-[11px] text-muted-foreground">{aiLocal ? '推荐将基于你家中的食材、忌口与过敏源，优先消耗临期食材。' : '推荐将基于网络热门菜品，不读取你的本地数据。'}</div>
+        {!online && <div role="status" className="mx-5 mt-2 rounded-lg bg-orange-50 px-3 py-2 text-xs text-orange-700">当前离线，厨房助手暂不可用；食材、菜谱、计划和采购仍可正常使用。</div>}
+        <div className="px-5 pt-2 text-[11px] text-muted-foreground">
+          {aiLocal ? `已同步 ${context.ingredients.length} 种食材 · ${context.allergies.length + context.dislikes.length} 项饮食限制` : '当前不会发送本地食材上下文。'}
+          {aiLocal && (
+            <details className="mt-1">
+              <summary className="cursor-pointer text-primary">查看当前上下文</summary>
+              <div className="mt-1 rounded-lg bg-secondary p-2 leading-5">
+                <p>食材：{context.ingredients.map(item => `${item.name} ${item.quantity}${item.unit}`).join('、') || '无'}</p>
+                <p>过敏：{context.allergies.join('、') || '无'}</p>
+                <p>忌口：{context.dislikes.join('、') || '无'}</p>
+              </div>
+            </details>
+          )}
+        </div>
 
         {/* 消息列表 */}
         <div ref={scrollRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto px-5 py-4">
@@ -1304,13 +1491,17 @@ function AiChat({ messages, busy, aiLocal, setAiLocal, onSend, onNewConversation
               <div className="mt-1 flex flex-wrap gap-2">{quicks.map(q => <button key={q} className="rounded-full border border-border px-3 py-1.5 text-xs" onClick={() => onSend(q)}>{q}</button>)}</div>
             </div>
           )}
-          {messages.map((m, i) => (
-            <div key={i}>
+          {!ready && <p className="text-center text-xs text-muted-foreground">正在恢复聊天记录…</p>}
+          {messages.map(m => (
+            <div key={m.id}>
               <div className={`rounded-2xl p-3 text-sm leading-6 ${m.role === 'user' ? 'ml-8 rounded-tr-sm bg-primary text-primary-foreground' : 'mr-8 rounded-tl-sm bg-secondary'}`}>
                 {m.role === 'assistant' ? <div className="whitespace-pre-wrap">{m.content || (m.status === 'streaming' ? '正在回答…' : '')}</div> : m.content}
               </div>
-              {m.status === 'error' && m.retryText && (
-                <button className="mt-1 text-xs text-primary underline" onClick={() => m.retryText && onSend(m.retryText)} disabled={busy}>重新发送</button>
+              {m.status === 'error' && (
+                <div className="mt-1 flex items-center gap-3 text-xs">
+                  <span className="text-destructive">回答未完成</span>
+                  <button className="text-primary underline" onClick={() => onRetry(m.id)} disabled={busy || !online}>重新发送</button>
+                </div>
               )}
               {m.role === 'assistant' && m.status !== 'error' && findMentionedRecipes(m.content, recipes).length > 0 && (
                 <div className="mt-1 flex flex-wrap gap-2">
@@ -1329,9 +1520,12 @@ function AiChat({ messages, busy, aiLocal, setAiLocal, onSend, onNewConversation
         {/* 输入区 */}
         <div className="border-t p-4">
           <div className="flex gap-2">
-            <input ref={inputRef} className={field} maxLength={2000} placeholder="问点什么？比如：晚上吃什么" onKeyDown={e => { if (e.key === 'Enter') submit() }} />
-            <button className={`${primary} shrink-0 px-5`} onClick={submit} disabled={busy}>发送</button>
+            <input ref={inputRef} className={field} maxLength={2000} placeholder={online ? '问点什么？比如：晚上吃什么' : '当前离线，AI 暂不可用'} disabled={!online || !ready} onKeyDown={e => { if (e.key === 'Enter') submit() }} />
+            {busy
+              ? <button className={`${secondary} shrink-0 px-4`} onClick={onCancel}>取消</button>
+              : <button className={`${primary} shrink-0 px-5`} onClick={submit} disabled={!online || !ready}>发送</button>}
           </div>
+          <p className="mt-2 text-[10px] leading-4 text-muted-foreground">AI 建议仅供家庭烹饪参考。如有严重食物过敏，请再次核对实际食材、调味品及包装成分。</p>
         </div>
       </div>
     </Sheet>

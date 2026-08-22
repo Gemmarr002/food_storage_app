@@ -62,3 +62,26 @@ export type AppData = {
   plan: MealPlan
   preferences: Preferences
 }
+
+export type Conversation = {
+  id: string
+  title: string
+  cozeSessionId: string
+  createdAt: string
+  updatedAt: string
+}
+
+export type ChatMessage = {
+  id: string
+  conversationId: string
+  role: 'user' | 'assistant'
+  content: string
+  status: 'streaming' | 'done' | 'error'
+  createdAt: string
+}
+
+export type ChatStreamEvent =
+  | { type: 'start' }
+  | { type: 'delta'; text: string }
+  | { type: 'done' }
+  | { type: 'error'; message: string }

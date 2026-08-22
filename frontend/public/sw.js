@@ -1,6 +1,6 @@
 // 食光 PWA Service Worker：静态资源缓存优先，页面导航网络优先、离线回退
-const CACHE = 'shiguang-v1'
-const APP_SHELL = ['/', '/manifest.webmanifest', '/food-icon.svg', '/icon-192.png', '/icon-512.png']
+const CACHE = 'shiguang-v1.4-20260821'
+const APP_SHELL = ['/', '/chat', '/manifest.webmanifest', '/food-icon.svg', '/icon-192.png', '/icon-512.png']
 
 self.addEventListener('install', e => {
   e.waitUntil(
